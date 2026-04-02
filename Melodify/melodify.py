@@ -1,4 +1,3 @@
-
 import customtkinter as ctk
 import tkinter as tk
 from tkinter import messagebox, filedialog
@@ -38,6 +37,46 @@ try:
     PYTUBE_AVAILABLE = True
 except ImportError:
     PYTUBE_AVAILABLE = False
+
+
+def lrclib_fetch(title: str, artist: str) -> dict:
+    """
+    Fetch lyrics from lrclib.net — free, no auth.
+    Returns dict with keys:
+      'plain'  – plain text lyrics (str or None)
+      'synced' – list of (seconds_float, line_str) tuples, or []
+    """
+    result = {"plain": None, "synced": []}
+    if not REQUESTS_AVAILABLE:
+        return result
+    try:
+        import urllib.parse
+        params = urllib.parse.urlencode({"track_name": title, "artist_name": artist})
+        r = requests.get(
+            f"https://lrclib.net/api/get?{params}", timeout=8,
+            headers={"User-Agent": "Melodify/1.0"})
+        if r.status_code != 200:
+            # try without artist
+            params2 = urllib.parse.urlencode({"track_name": title})
+            r = requests.get(
+                f"https://lrclib.net/api/get?{params2}", timeout=8,
+                headers={"User-Agent": "Melodify/1.0"})
+        if r.status_code == 200:
+            data = r.json()
+            result["plain"] = (data.get("plainLyrics") or "").strip() or None
+            synced_raw = data.get("syncedLyrics") or ""
+            if synced_raw:
+                lines = []
+                for ln in synced_raw.splitlines():
+                    m = re.match(r'\[(\d+):(\d+\.\d+)\]\s*(.*)', ln)
+                    if m:
+                        secs = int(m.group(1)) * 60 + float(m.group(2))
+                        lines.append((secs, m.group(3)))
+                result["synced"] = lines
+    except Exception as e:
+        print(f"lrclib error: {e}")
+    return result
+
 
 try:
     import pygame
@@ -165,6 +204,22 @@ def apply_accent(color: str):
     C["accent"]  = color
     C["acc_h"]   = _hex_scale(color, 1.12)
     C["acc_dim"] = _hex_scale(color, 0.70)
+
+def open_in_folder(filepath: str):
+    """Open the system file manager at the folder containing filepath."""
+    import platform
+    folder = str(Path(filepath).parent)
+    system = platform.system()
+    try:
+        if system == "Windows":
+            subprocess.Popen(["explorer", "/select,", filepath])
+        elif system == "Darwin":
+            subprocess.Popen(["open", "-R", filepath])
+        else:
+            subprocess.Popen(["xdg-open", folder])
+    except Exception as e:
+        print(f"open_in_folder error: {e}")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DATA MANAGER
@@ -917,6 +972,20 @@ class SongCard(ctk.CTkFrame):
             del_btn.pack(side="left", padx=3)
             Tooltip(del_btn, "Delete song")
 
+        # Open in folder (plays the song + reveals file in explorer)
+        if self.downloaded and self.song.get("file"):
+            def _play_and_open(s=self.song):
+                if self.on_play:
+
+                    open_in_folder(s["file"])
+            folder_btn = ctk.CTkButton(
+                bf, text="📁", width=34, height=34,
+                fg_color="transparent", hover_color=C["hover"],
+                corner_radius=17, font=("Arial", 14),
+                text_color=C["dim"], command=_play_and_open)
+            folder_btn.pack(side="left", padx=3)
+            Tooltip(folder_btn, "Play & show in folder")
+
     # ── helpers ────────────────────────────────────────────────────────────────
     def _load_thumb(self, url, container):
         try:
@@ -1058,6 +1127,10 @@ class MelodifyApp(ctk.CTk):
         self.shuffle_mode    = False
         self.repeat_mode     = False  # repeat single song
         self._shuffle_order  = []   # shuffled indices
+        self._lyrics_cache    = None
+        self._lyrics_loading  = False
+        self._np_win          = None
+        self._np_lyrics_ready = False
 
         self._build_ui()
         # Validate library on every launch
@@ -1137,6 +1210,26 @@ class MelodifyApp(ctk.CTk):
         def log(msg):
             self.after(0, lambda m=msg: self._ffmpeg_log_append(m))
 
+        def run_logged(cmd, shell=False):
+            cmd_label = cmd if isinstance(cmd, str) else " ".join(cmd)
+            log(f"$ {cmd_label}")
+            p = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                shell=shell
+            )
+            lines = []
+            if p.stdout:
+                for line in p.stdout:
+                    line = line.rstrip()
+                    if line:
+                        log(line)
+                        lines.append(line)
+            p.wait()
+            return p.returncode, "\n".join(lines)
+
         def done(ok):
             global FFMPEG_AVAILABLE
             FFMPEG_AVAILABLE = _check_ffmpeg()
@@ -1155,46 +1248,47 @@ class MelodifyApp(ctk.CTk):
 
         try:
             if system == "Windows":
-                log("Checking for Scoop package manager…")
-                scoop_check = subprocess.run(
-                    ["powershell", "-Command", "Get-Command scoop"],
-                    capture_output=True, text=True)
+                ps = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"]
+                scoop_cmd = Path.home() / "scoop" / "shims" / "scoop.cmd"
 
-                if scoop_check.returncode != 0:
-                    log("Scoop not found — installing Scoop…")
+                log("Checking for Scoop package manager...")
+                scoop_check, _ = run_logged(["where.exe", "scoop"])
+                if scoop_check != 0 and scoop_cmd.exists():
+                    scoop_check = 0
+                    log(f"Using local Scoop shim: {scoop_cmd}")
+
+                if scoop_check != 0:
+                    log("Scoop not found - installing Scoop...")
                     install_scoop = (
-                        'Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser -Force; '
-                        'Invoke-RestMethod -Uri https://get.scoop.sh | Invoke-Expression'
+                        "Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser -Force; "
+                        "Invoke-RestMethod -Uri https://get.scoop.sh | Invoke-Expression"
                     )
-                    result = subprocess.run(
-                        ["powershell", "-Command", install_scoop],
-                        capture_output=True, text=True)
-                    if result.returncode != 0:
-                        log(f"Scoop install failed: {result.stderr[:200]}")
+                    rc, _ = run_logged(ps + [install_scoop])
+                    if rc != 0:
+                        log("Scoop install failed.")
                         # Try winget as fallback
-                        log("Trying winget instead…")
-                        r2 = subprocess.run(
+                        log("Trying winget instead...")
+                        rc2, _ = run_logged(
                             ["winget", "install", "--id=Gyan.FFmpeg", "-e",
-                             "--accept-package-agreements", "--accept-source-agreements"],
-                            capture_output=True, text=True)
-                        done(r2.returncode == 0)
+                             "--accept-package-agreements", "--accept-source-agreements"]
+                        )
+                        done(rc2 == 0)
                         return
-                    log("✓ Scoop installed.")
+                    log("Scoop installed.")
                 else:
-                    log("✓ Scoop already installed.")
+                    log("Scoop already installed.")
 
-                log("Installing ffmpeg via Scoop…")
-                result = subprocess.run(
-                    ["powershell", "-Command", "scoop install ffmpeg"],
-                    capture_output=True, text=True)
-                log(result.stdout[-300:] if result.stdout else "")
-                if result.returncode != 0:
-                    log(f"Scoop ffmpeg failed, trying winget…")
-                    r2 = subprocess.run(
+                # Scoop may not be available in PATH until shell restart.
+                scoop_runner = [str(scoop_cmd)] if scoop_cmd.exists() else ps + ["scoop"]
+                log("Installing ffmpeg via Scoop...")
+                rc, _ = run_logged(scoop_runner + ["install", "ffmpeg"])
+                if rc != 0:
+                    log("Scoop ffmpeg failed, trying winget...")
+                    rc2, _ = run_logged(
                         ["winget", "install", "--id=Gyan.FFmpeg", "-e",
-                         "--accept-package-agreements", "--accept-source-agreements"],
-                        capture_output=True, text=True)
-                    done(r2.returncode == 0)
+                         "--accept-package-agreements", "--accept-source-agreements"]
+                    )
+                    done(rc2 == 0)
                     return
                 done(True)
 
@@ -1358,8 +1452,8 @@ class MelodifyApp(ctk.CTk):
         bar.grid_propagate(False)
         bar.grid_columnconfigure(1, weight=1)
 
-        # song info
-        info = ctk.CTkFrame(bar, fg_color="transparent", width=260)
+        # song info — clickable to open now-playing view
+        info = ctk.CTkFrame(bar, fg_color="transparent", width=260, cursor="hand2")
         info.grid(row=0, column=0, padx=20, pady=10, sticky="w")
         info.grid_propagate(False)
         self.bar_title = ctk.CTkLabel(
@@ -1371,6 +1465,9 @@ class MelodifyApp(ctk.CTk):
             info, text="", font=("Arial", 11),
             text_color=C["fg2"], width=240, anchor="w")
         self.bar_artist.pack(anchor="w")
+        # click anywhere on info to open now-playing
+        for w in (info, self.bar_title, self.bar_artist):
+            w.bind("<Button-1>", lambda e: self._open_now_playing())
 
         # controls
         ctrl = ctk.CTkFrame(bar, fg_color="transparent")
@@ -1635,31 +1732,85 @@ class MelodifyApp(ctk.CTk):
 
     def _run_search(self, q):
         results = dl.search(q)
-        self.after(0, lambda: self._show_results(results, q))
+        orig = self._detect_original(results, q)
+        self.after(0, lambda: self._show_results(results, q, orig))
 
-    def _show_results(self, results, q):
+    @staticmethod
+    def _detect_original(results: list, query: str) -> dict | None:
+        """
+        Pick the most likely original/official upload.
+        Prefer official audio over music video (audio is the song itself).
+        """
+        if not results:
+            return None
+
+        def _score(r):
+            ch = (r.get("artist") or "").lower()
+            ti = (r.get("title")  or "").lower()
+            if "vevo" in ch and ("audio" in ti or "official audio" in ti): return 0
+            if "vevo" in ch:                                                return 1
+            if "official audio" in ti:                                      return 2
+            if "official" in ch:                                            return 3
+            if "official video" in ti or "official music video" in ti:      return 4
+            if "official" in ti:                                            return 5
+            return 9
+
+        best = min(results, key=_score)
+        artist = re.sub(r'(?i)\s*vevo$|\s*-\s*topic$', '', best.get("artist", "")).strip()
+        return {
+            "artist": artist or best.get("artist", ""),
+            "title":  best.get("title", query),
+            "yt_id":  best.get("id", ""),
+            "result": best,   # full result dict for SongCard
+        }
+
+    def _show_results(self, results, q, orig=None):
         self._clear()
         ctk.CTkLabel(self.content,
                      text=f'Results for "{q}"',
                      font=("Arial", 20, "bold"),
-                     text_color=C["fg"]).pack(anchor="w", pady=(10, 12))
-        if not results:
-            ctk.CTkLabel(
-                self.content,
-                text="No results. Make sure yt-dlp is installed:\n  pip install yt-dlp",
-                font=("Arial", 13),
-                text_color=C["fg2"]
-            ).pack(pady=20)
+                     text_color=C["fg"]).pack(anchor="w", pady=(10, 8))
+
+        # ── Pinned original at top ─────────────────────────────────────────────
+        if orig and orig.get("result"):
+            best = orig["result"]
+            oa   = orig["artist"]
+
+            # Small label above
+            tk.Label(self.content,
+                     text=f"  ✓  Original · {oa}  ",
+                     font=("Arial", 10, "bold"),
+                     bg=C["bg2"], fg=C["accent"]
+                     ).pack(anchor="w", pady=(0, 2))
+
+            already = best["id"] in dm.data["songs"]
+            SongCard(self.content, best,
+                     on_play=self._play_song if already else None,
+                     on_download=self._download_song if not already else None,
+                     downloaded=already,
+                     refresh_sidebar=self._refresh_pl_sidebar,
+                     ).pack(fill="x", pady=(0, 2))
+
+            # thin divider
+            tk.Frame(self.content, bg=C["hover"], height=1).pack(fill="x", pady=(4, 8))
+
+            # remove the pinned entry from the rest so it doesn't appear twice
+            results = [r for r in results if r["id"] != best["id"]]
+
+        # ── Remaining results ─────────────────────────────────────────────────
+        if not results and not orig:
+            ctk.CTkLabel(self.content,
+                         text="No results. Make sure yt-dlp is installed:\n  pip install yt-dlp",
+                         font=("Arial", 13), text_color=C["fg2"]).pack(pady=20)
             return
         for r in results:
             already = r["id"] in dm.data["songs"]
-            SongCard(
-                self.content, r,
-                on_play=self._play_song if already else None,
-                on_download=self._download_song if not already else None,
-                downloaded=already,
-                refresh_sidebar=self._refresh_pl_sidebar,
-            ).pack(fill="x", pady=3)
+            SongCard(self.content, r,
+                     on_play=self._play_song if already else None,
+                     on_download=self._download_song if not already else None,
+                     downloaded=already,
+                     refresh_sidebar=self._refresh_pl_sidebar,
+                     ).pack(fill="x", pady=3)
 
     # ── LIBRARY ────────────────────────────────────────────────────────────────
     def _show_library(self):
@@ -1880,6 +2031,267 @@ class MelodifyApp(ctk.CTk):
         self.bar_title.configure(text=meta.get("title", "")[:50])
         self.bar_artist.configure(text=meta.get("artist", ""))
         self.play_btn.configure(text="⏸")
+        # Pre-fetch lyrics in background for now-playing view
+        self._lyrics_cache    = None
+        self._lyrics_loading  = True
+        self._np_lyrics_ready = False
+        threading.Thread(target=self._fetch_lyrics_bg, daemon=True).start()
+        # Update now-playing if open
+        if hasattr(self, "_np_win") and self._np_win and self._np_win.winfo_exists():
+            self._np_win.after(0, self._np_update_song)
+
+    def _fetch_lyrics_bg(self):
+        meta = self.current_song
+        if not meta:
+            return
+        raw_title  = meta.get("title", "")
+        raw_artist = meta.get("artist", "")
+        clean_artist = re.sub(r'(?i)\s*vevo$|\s*-\s*topic$', '', raw_artist).strip()
+        clean_title  = re.sub(
+            r'\s*[\(\[](official\s*(video|audio|music\s*video|mv)?'
+            r'|lyrics?|hd|hq|explicit)[^\)\]]*[\)\]]',
+            '', raw_title, flags=re.IGNORECASE).strip()
+        if clean_artist and ' - ' in clean_title:
+            parts = clean_title.split(' - ', 1)
+            if parts[0].strip().lower() in clean_artist.lower():
+                clean_title = parts[1].strip()
+        data = lrclib_fetch(clean_title or raw_title, clean_artist or raw_artist)
+        self._lyrics_cache   = data
+        self._lyrics_loading = False
+        if hasattr(self, "_np_win") and self._np_win and self._np_win.winfo_exists():
+            self._np_win.after(0, self._np_refresh_lyrics)
+
+    def _open_now_playing(self):
+        if not self.current_song:
+            return
+        if hasattr(self, "_np_win") and self._np_win and self._np_win.winfo_exists():
+            self._np_win.lift()
+            return
+
+        win = tk.Toplevel(self)
+        self._np_win = win
+        win.title("Now Playing")
+        win.geometry("700x640")
+        win.configure(bg=C["bg"])
+        win.resizable(True, True)
+
+        # ── Header: thumbnail + song info ──────────────────────────────────────
+        hdr = tk.Frame(win, bg=C["bg"])
+        hdr.pack(fill="x", padx=30, pady=(28, 0))
+
+        self._np_thumb_lbl = tk.Label(hdr, bg=C["hover"], width=10, height=5,
+                                      text="♪", font=("Arial", 36), fg=C["accent"])
+        self._np_thumb_lbl.pack(side="left")
+
+        txt = tk.Frame(hdr, bg=C["bg"])
+        txt.pack(side="left", padx=20, fill="x", expand=True)
+        self._np_title_lbl  = tk.Label(txt, text="", font=("Arial", 20, "bold"),
+                                        bg=C["bg"], fg=C["fg"], anchor="w", justify="left",
+                                        wraplength=380)
+        self._np_title_lbl.pack(anchor="w")
+        self._np_artist_lbl = tk.Label(txt, text="", font=("Arial", 13),
+                                        bg=C["bg"], fg=C["fg2"], anchor="w")
+        self._np_artist_lbl.pack(anchor="w", pady=(4, 0))
+
+        # ── Tab bar: Info / Lyrics ─────────────────────────────────────────────
+        tab_bar = tk.Frame(win, bg=C["bg"])
+        tab_bar.pack(fill="x", padx=30, pady=(20, 0))
+
+        self._np_tab = tk.StringVar(value="lyrics")
+
+        def _switch(tab):
+            self._np_tab.set(tab)
+            info_btn.configure(
+                relief="flat",
+                fg=C["accent"] if tab == "info" else C["fg2"],
+                font=("Arial", 12, "bold") if tab == "info" else ("Arial", 12))
+            lyr_btn.configure(
+                relief="flat",
+                fg=C["accent"] if tab == "lyrics" else C["fg2"],
+                font=("Arial", 12, "bold") if tab == "lyrics" else ("Arial", 12))
+            info_frame.pack_forget()
+            lyr_frame.pack_forget()
+            if tab == "info":
+                info_frame.pack(fill="both", expand=True, padx=30, pady=10)
+            else:
+                lyr_frame.pack(fill="both", expand=True, padx=0, pady=0)
+
+        info_btn = tk.Button(tab_bar, text="Info", font=("Arial", 12),
+                             bg=C["bg"], fg=C["fg2"], relief="flat", bd=0,
+                             activebackground=C["bg"], activeforeground=C["accent"],
+                             command=lambda: _switch("info"))
+        info_btn.pack(side="left", padx=(0, 20))
+
+        lyr_btn = tk.Button(tab_bar, text="Lyrics", font=("Arial", 12, "bold"),
+                            bg=C["bg"], fg=C["accent"], relief="flat", bd=0,
+                            activebackground=C["bg"], activeforeground=C["accent"],
+                            command=lambda: _switch("lyrics"))
+        lyr_btn.pack(side="left")
+
+        tk.Frame(win, bg=C["hover"], height=1).pack(fill="x", padx=30, pady=(8, 0))
+
+        # ── Info tab ───────────────────────────────────────────────────────────
+        info_frame = tk.Frame(win, bg=C["bg"])
+
+        # ── Lyrics tab ────────────────────────────────────────────────────────
+        lyr_frame = tk.Frame(win, bg=C["bg"])
+        lyr_frame.pack(fill="both", expand=True, padx=0, pady=0)
+
+        self._np_canvas    = tk.Canvas(lyr_frame, bg=C["bg"], highlightthickness=0)
+        self._np_scrollbar = tk.Scrollbar(lyr_frame, orient="vertical",
+                                          command=self._np_canvas.yview)
+        self._np_canvas.configure(yscrollcommand=self._np_scrollbar.set)
+        self._np_scrollbar.pack(side="right", fill="y")
+        self._np_canvas.pack(side="left", fill="both", expand=True)
+
+        self._np_lyr_inner = tk.Frame(self._np_canvas, bg=C["bg"])
+        self._np_canvas_window = self._np_canvas.create_window(
+            (0, 0), window=self._np_lyr_inner, anchor="nw")
+
+        def _on_configure(e):
+            self._np_canvas.configure(scrollregion=self._np_canvas.bbox("all"))
+        def _on_canvas_resize(e):
+            self._np_canvas.itemconfig(self._np_canvas_window, width=e.width)
+        self._np_lyr_inner.bind("<Configure>", _on_configure)
+        self._np_canvas.bind("<Configure>", _on_canvas_resize)
+
+        self._np_line_labels = []   # list of tk.Label, one per lyric line
+        self._np_synced      = []   # [(secs, text), ...]
+        self._np_cur_line    = -1
+
+        self._np_update_song()
+        self._np_tick()
+        win.bind("<Destroy>", lambda e: setattr(self, "_np_win", None))
+
+    def _np_update_song(self):
+        """Refresh header with current song metadata + trigger lyrics reload."""
+        meta = self.current_song
+        if not meta or not hasattr(self, "_np_title_lbl"):
+            return
+        self._np_title_lbl.configure(text=meta.get("title", "")[:80])
+        self._np_artist_lbl.configure(text=meta.get("artist", ""))
+        self._np_line_labels  = []
+        self._np_synced       = []
+        self._np_cur_line     = -1
+        self._np_lyrics_ready = False
+        for w in self._np_lyr_inner.winfo_children():
+            w.destroy()
+        tk.Label(self._np_lyr_inner, text="Loading lyrics…",
+                 font=("Arial", 13), bg=C["bg"], fg=C["dim"]
+                 ).pack(pady=40)
+
+        # If lyrics already fetched (song was playing before window opened), show now
+        if not self._lyrics_loading and self._lyrics_cache is not None:
+            self._np_refresh_lyrics()
+
+        # load thumbnail
+        th = meta.get("thumbnail")
+        if th and PIL_AVAILABLE:
+            threading.Thread(target=self._np_load_thumb, args=(th,), daemon=True).start()
+
+    def _np_load_thumb(self, url):
+        try:
+            from io import BytesIO
+            from PIL import ImageTk
+            if url.startswith("http") and REQUESTS_AVAILABLE:
+                r   = requests.get(url, timeout=5)
+                img = Image.open(BytesIO(r.content)).resize((110, 110))
+            else:
+                img = Image.open(url).resize((110, 110))
+            photo = ImageTk.PhotoImage(img)
+            def _apply():
+                if hasattr(self, "_np_thumb_lbl") and self._np_thumb_lbl.winfo_exists():
+                    self._np_thumb_lbl.configure(image=photo, text="",
+                                                  width=110, height=110)
+                    self._np_thumb_lbl.image = photo  # keep reference
+            self.after(0, _apply)
+        except Exception:
+            pass
+
+    def _np_refresh_lyrics(self):
+        """Called after lyrics finish loading in background."""
+        if not hasattr(self, "_np_lyr_inner") or not self._np_lyr_inner.winfo_exists():
+            return
+        self._np_lyrics_ready = True
+        for w in self._np_lyr_inner.winfo_children():
+            w.destroy()
+        self._np_line_labels = []
+        self._np_synced      = []
+        self._np_cur_line    = -1
+
+        data   = self._lyrics_cache or {}
+        synced = data.get("synced", [])
+        plain  = data.get("plain")
+
+        if synced:
+            self._np_synced = synced
+            tk.Label(self._np_lyr_inner, text="", bg=C["bg"], height=2).pack()
+            for _secs, line in synced:
+                lbl = tk.Label(
+                    self._np_lyr_inner,
+                    text=line or " ",
+                    font=("Arial", 15),
+                    bg=C["bg"], fg=C["dim"],
+                    wraplength=580, justify="center", pady=6)
+                lbl.pack(fill="x", padx=40)
+                self._np_line_labels.append(lbl)
+            tk.Label(self._np_lyr_inner, text="", bg=C["bg"], height=4).pack()
+        elif plain:
+            tk.Label(self._np_lyr_inner, text="", bg=C["bg"], height=2).pack()
+            for line in plain.splitlines():
+                tk.Label(
+                    self._np_lyr_inner,
+                    text=line or " ",
+                    font=("Arial", 15),
+                    bg=C["bg"], fg=C["fg2"],
+                    wraplength=580, justify="center", pady=5
+                ).pack(fill="x", padx=40)
+            tk.Label(self._np_lyr_inner, text="", bg=C["bg"], height=4).pack()
+        else:
+            tk.Label(self._np_lyr_inner,
+                     text="Lyrics not found in lrclib database.",
+                     font=("Arial", 13), bg=C["bg"], fg=C["dim"]
+                     ).pack(pady=60)
+
+    def _np_tick(self):
+        """250ms tick: sync lyric highlight to playback position."""
+        try:
+            if not self._np_win or not self._np_win.winfo_exists():
+                return
+        except Exception:
+            return
+
+        # If lyrics just finished loading, render them
+        if not self._lyrics_loading and self._lyrics_cache is not None:
+            if not getattr(self, "_np_lyrics_ready", False):
+                self._np_refresh_lyrics()
+
+        # Sync highlighted line
+        if self._np_synced and player.is_playing and self.current_song:
+            pos = player.position
+            cur = -1
+            for i, (secs, _) in enumerate(self._np_synced):
+                if secs <= pos:
+                    cur = i
+            if cur != self._np_cur_line:
+                if 0 <= self._np_cur_line < len(self._np_line_labels):
+                    self._np_line_labels[self._np_cur_line].configure(
+                        fg=C["dim"], font=("Arial", 15))
+                if 0 <= cur < len(self._np_line_labels):
+                    self._np_line_labels[cur].configure(
+                        fg=C["fg"], font=("Arial", 18, "bold"))
+                    # Auto-scroll to keep active line vertically centred
+                    lbl = self._np_line_labels[cur]
+                    self._np_lyr_inner.update_idletasks()
+                    y     = lbl.winfo_y()
+                    h     = self._np_canvas.winfo_height()
+                    total = self._np_lyr_inner.winfo_height()
+                    if total > 0:
+                        frac = max(0.0, min(1.0, (y - h // 2) / total))
+                        self._np_canvas.yview_moveto(frac)
+                self._np_cur_line = cur
+
+        self._np_win.after(250, self._np_tick)
 
     def _toggle_pause(self):
         if not player.is_playing:
